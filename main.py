@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import shutil
 import asyncio
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_TASKS = {}
 
-# --- 1. Railway Health Web Server ---
+# --- 1. Railway Health Server ---
 async def ping_handler(request):
     return web.Response(text="Bot is running 24/7 on Railway!", status=200)
 
@@ -67,7 +68,7 @@ async def stale_cleanup_worker():
                 except Exception:
                     pass
 
-# --- 4. Pyrogram Bot Client ---
+# --- 4. Pyrogram Bot Instance ---
 bot = Client(
     "railway_uploader_bot",
     api_id=config.API_ID,
@@ -75,6 +76,79 @@ bot = Client(
     bot_token=config.BOT_TOKEN,
     max_concurrent_transmissions=4
 )
+
+# --- Helper: Advanced Timing Parser ---
+def parse_time_seconds(time_val: str) -> int:
+    if not time_val:
+        return 0
+    parts = time_val.strip().split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + int(float(parts[1]))
+        elif len(parts) == 1:
+            return int(float(parts[0]))
+    except Exception:
+        return 0
+    return 0
+
+def parse_sample_arguments(args: list):
+    clean_args = []
+    extracted_uri = None
+    for a in args:
+        if a.startswith("http://") or a.startswith("https://") or a.startswith("magnet:?"):
+            extracted_uri = a
+        else:
+            clean_args.append(a)
+
+    raw_timing = " ".join(clean_args).strip()
+    start_str = "00:01:00"
+    duration = 30
+
+    if not raw_timing:
+        return start_str, duration, extracted_uri
+
+    # Handles "00:05:00 to 00:05:55"
+    if " to " in raw_timing.lower():
+        parts = re.split(r"\s+to\s+", raw_timing, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            s_sec = parse_time_seconds(parts[0])
+            e_sec = parse_time_seconds(parts[1])
+            if e_sec > s_sec:
+                return parts[0].strip(), (e_sec - s_sec), extracted_uri
+            return parts[0].strip(), 30, extracted_uri
+
+    # Handles "00:05:00 - 00:05:55"
+    if "-" in raw_timing and not raw_timing.startswith("-"):
+        parts = raw_timing.split("-")
+        if len(parts) == 2:
+            s_sec = parse_time_seconds(parts[0])
+            e_sec = parse_time_seconds(parts[1])
+            if e_sec > s_sec:
+                return parts[0].strip(), (e_sec - s_sec), extracted_uri
+            return parts[0].strip(), 30, extracted_uri
+
+    # Handles "00:05:00 55" or "00:05:00 00:05:55"
+    if len(clean_args) >= 2:
+        arg1, arg2 = clean_args[0], clean_args[1]
+        if ":" in arg2:
+            s_sec = parse_time_seconds(arg1)
+            e_sec = parse_time_seconds(arg2)
+            dur = (e_sec - s_sec) if e_sec > s_sec else 30
+            return arg1, dur, extracted_uri
+        elif arg2.isdigit():
+            return arg1, int(arg2), extracted_uri
+
+    # Handles single argument: "00:05:00" or "45"
+    if len(clean_args) == 1:
+        arg = clean_args[0]
+        if ":" in arg:
+            return arg, 30, extracted_uri
+        elif arg.isdigit():
+            return "00:01:00", int(arg), extracted_uri
+
+    return start_str, duration, extracted_uri
 
 # --- 5. Message Handlers ---
 @bot.on_message(filters.command("start"))
@@ -90,13 +164,14 @@ async def start_command(_, message: Message):
         f"🆔 **Your Telegram ID:** `{user_id}`\n"
         f"👑 **Owner ID:** `{config.OWNER_ID}`\n"
         f"🔰 **Your Status:** {status_label}\n\n"
-        "**Send me any of the following:**\n"
-        "• Direct video / leech URLs (`.mkv`, `.mp4`)\n"
+        "**Send or forward any of the following:**\n"
+        "• Telegram Video / Document (`.mkv`, `.mp4`)\n"
+        "• Direct Download URLs (`.mkv`, `.mp4`)\n"
         "• Magnet links (`magnet:?xt=...`)\n"
         "• `.torrent` files\n\n"
-        "**Custom Sample Command:**\n"
-        "`/sample <start_time> <duration> <url>`\n"
-        "*(Example: `/sample 00:05:00 30 https://...` or reply to a link)*"
+        "**Sample Video Commands:**\n"
+        "• Reply to any file/link with: `/sample 00:05:00 to 00:05:55`\n"
+        "• Or send: `/sample 00:05:00 30 <link>`"
     )
 
 @bot.on_message(filters.command("auth") & filters.user(config.OWNER_ID))
@@ -132,7 +207,7 @@ async def users_command(_, message: Message):
     reply += "\n".join([f"• `{uid}`" for uid in users]) if users else "• _No extra authorized users._"
     await message.reply_text(reply)
 
-# --- 6. Custom Timing /sample Command ---
+# --- 6. Smart /sample Command (Supports Telegram Files, Links & Magnet) ---
 @bot.on_message(filters.command("sample") & filters.private)
 async def sample_command_handler(_, message: Message):
     user_id = message.from_user.id
@@ -140,53 +215,68 @@ async def sample_command_handler(_, message: Message):
         return await message.reply_text("⛔ You are not authorized to use this bot.")
 
     args = message.command[1:]
-    start_time = "00:01:00"
-    duration = 30
-    uri = None
+    start_time, duration, uri = parse_sample_arguments(args)
+    telegram_media = None
 
-    # Option A: Reply to an existing link or .torrent file
+    # Check if replying to an existing Telegram message
     if message.reply_to_message:
         replied = message.reply_to_message
-        if replied.text:
-            uri = replied.text.strip()
-        elif replied.document and replied.document.file_name.endswith(".torrent"):
-            uri = await replied.download(file_name=os.path.join(config.DOWNLOAD_DIR, f"{replied.id}.torrent"))
         
-        if len(args) >= 1:
-            start_time = args[0]
-        if len(args) >= 2 and args[1].isdigit():
-            duration = int(args[1])
+        # Replying to a Telegram video or document (.mkv, .mp4, etc.)
+        if replied.video:
+            telegram_media = replied.video
+        elif replied.document:
+            if replied.document.file_name and replied.document.file_name.lower().endswith(".torrent"):
+                uri = await replied.download(file_name=os.path.join(config.DOWNLOAD_DIR, f"{replied.id}.torrent"))
+            else:
+                telegram_media = replied.document
+        
+        # Replying to a message with a text URL or caption URL
+        if not telegram_media and not uri:
+            target_text = replied.text or replied.caption or ""
+            for word in target_text.split():
+                if word.startswith("http://") or word.startswith("https://") or word.startswith("magnet:?"):
+                    uri = word.strip()
+                    break
 
-    # Option B: /sample <start_time> <duration> <url>
-    elif len(args) >= 3:
-        start_time = args[0]
-        duration = int(args[1]) if args[1].isdigit() else 30
-        uri = args[2]
-
-    # Option C: /sample <start_time> <url>
-    elif len(args) == 2 and (args[1].startswith("http") or args[1].startswith("magnet:")):
-        start_time = args[0]
-        uri = args[1]
-
-    if not uri or not (uri.startswith("http://") or uri.startswith("https://") or uri.startswith("magnet:?") or os.path.exists(uri)):
+    # If no media or link is detected
+    if not uri and not telegram_media:
         return await message.reply_text(
             "ℹ️ **How to use /sample:**\n\n"
-            "**Format:**\n"
-            "`/sample <start_time> <duration_sec> <link>`\n\n"
-            "**Example:**\n"
-            "`/sample 00:05:30 45 https://site.com/movie.mkv`\n\n"
-            "*(Or reply to any link/torrent message with `/sample 00:05:30 45`)*"
+            "**1. Reply to any Telegram video / .mkv file:**\n"
+            "`/sample 00:05:00 to 00:05:55`\n"
+            "`/sample 00:05:00 45`\n\n"
+            "**2. With a direct link or magnet:**\n"
+            "`/sample 00:05:00 to 00:05:55 <link>`\n"
+            "`/sample 00:05:00 30 <link>`"
         )
 
-    task_id = f"custom_sample_{message.id}"
+    task_id = f"sample_{message.id}"
     task_dir = os.path.join(config.DOWNLOAD_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
-    status_msg = await message.reply_text(f"⏳ **Downloading source to slice {duration}s clip from `{start_time}`...**")
+    status_msg = await message.reply_text(f"⏳ **Preparing source for {duration}s clip from `{start_time}`...**")
 
     try:
-        downloaded_file = await download_content(uri, task_dir, status_msg)
+        downloaded_file = None
+
+        # Case A: Download directly from Telegram servers
+        if telegram_media:
+            await status_msg.edit_text("📥 **Downloading Telegram video to Railway server...**")
+            file_name = getattr(telegram_media, "file_name", "input_video.mp4") or "input_video.mp4"
+            dest_path = os.path.join(task_dir, file_name)
+            tracker = ProgressTracker(status_msg, "Downloading Telegram File")
+            downloaded_file = await bot.download_media(
+                message=telegram_media,
+                file_name=dest_path,
+                progress=tracker.progress_callback
+            )
+
+        # Case B: Download via aria2c from URL/Magnet/Torrent
+        elif uri:
+            downloaded_file = await download_content(uri, task_dir, status_msg)
+
         if not downloaded_file or not os.path.exists(downloaded_file):
-            return await status_msg.edit_text("❌ Download failed or empty file received.")
+            return await status_msg.edit_text("❌ Failed to obtain source video.")
 
         await status_msg.edit_text(f"✂️ **Cropping sample clip:** `{start_time}` (+`{duration}s`)...")
         
@@ -204,9 +294,8 @@ async def sample_command_handler(_, message: Message):
             chat_id=message.chat.id,
             video=clip,
             caption=(
-                f"✂️ **Custom Sample Video**\n\n"
-                f"⏱️ **Start Time:** `{start_time}`\n"
-                f"⏳ **Duration:** `{duration}s`\n"
+                f"✂️ **Sample Clip ({duration}s)**\n\n"
+                f"⏱️ **Interval:** `{start_time}` (Duration: `{duration}s`)\n"
                 f"🎬 **Original:** `{os.path.basename(downloaded_file)}`"
             ),
             thumb=sample_thumb if os.path.exists(sample_thumb) else None,
@@ -216,13 +305,13 @@ async def sample_command_handler(_, message: Message):
         await status_msg.delete()
 
     except Exception as e:
-        logger.error(f"Custom sample error: {e}")
+        logger.error(f"Sample error: {e}")
         await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
 
-# --- 7. Media / Link Receiver ---
-@bot.on_message((filters.text | filters.document) & filters.private)
+# --- 7. Incoming Media & Link Handler ---
+@bot.on_message((filters.text | filters.document | filters.video) & filters.private)
 async def incoming_handler(_, message: Message):
     user_id = message.from_user.id
     logger.info(f"📩 Incoming media/link from User ID: {user_id}")
@@ -233,21 +322,33 @@ async def incoming_handler(_, message: Message):
         )
 
     uri = None
+    is_tg_file = False
+
     if message.text:
         text = message.text.strip()
         if text.startswith("http://") or text.startswith("https://") or text.startswith("magnet:?"):
             uri = text
-    elif message.document and message.document.file_name.endswith(".torrent"):
-        status = await message.reply_text("📥 Receiving .torrent metadata...")
-        saved_torrent = await message.download(file_name=os.path.join(config.DOWNLOAD_DIR, f"{message.id}.torrent"))
-        uri = saved_torrent
-        await status.delete()
+    elif message.document:
+        if message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
+            status = await message.reply_text("📥 Receiving .torrent metadata...")
+            saved_torrent = await message.download(file_name=os.path.join(config.DOWNLOAD_DIR, f"{message.id}.torrent"))
+            uri = saved_torrent
+            await status.delete()
+        else:
+            is_tg_file = True
+    elif message.video:
+        is_tg_file = True
 
-    if not uri:
+    if not uri and not is_tg_file:
         return
 
     task_id = str(message.id)
-    ACTIVE_TASKS[task_id] = {"uri": uri, "user_id": user_id}
+    ACTIVE_TASKS[task_id] = {
+        "uri": uri,
+        "is_tg_file": is_tg_file,
+        "message": message,
+        "user_id": user_id
+    }
 
     markup = InlineKeyboardMarkup([
         [
@@ -282,13 +383,28 @@ async def process_task_callback(_, query: CallbackQuery):
         return await query.answer("You didn't initiate this task.", show_alert=True)
 
     await query.message.edit_reply_markup(reply_markup=None)
-    status_msg = await query.message.reply_text("🚀 **Initializing Railway gigabit network download...**")
+    status_msg = await query.message.reply_text("🚀 **Initializing process...**")
     
     task_dir = os.path.join(config.DOWNLOAD_DIR, f"task_{task_id}")
     os.makedirs(task_dir, exist_ok=True)
 
     try:
-        downloaded_file = await download_content(task["uri"], task_dir, status_msg)
+        downloaded_file = None
+
+        if task.get("is_tg_file"):
+            orig_msg = task["message"]
+            media = orig_msg.video or orig_msg.document
+            file_name = getattr(media, "file_name", "input_video.mp4") or "input_video.mp4"
+            dest_path = os.path.join(task_dir, file_name)
+            tracker = ProgressTracker(status_msg, "Downloading Telegram File")
+            downloaded_file = await bot.download_media(
+                message=media,
+                file_name=dest_path,
+                progress=tracker.progress_callback
+            )
+        else:
+            downloaded_file = await download_content(task["uri"], task_dir, status_msg)
+
         if not downloaded_file or not os.path.exists(downloaded_file):
             return await status_msg.edit_text("❌ Download failed or empty file received.")
 
@@ -381,7 +497,7 @@ async def start_all():
     asyncio.create_task(stale_cleanup_worker())
     logger.info("Starting Pyrogram bot...")
     await bot.start()
-    logger.info("Bot is running and actively listening for updates.")
+    logger.info("Bot is listening for messages via Pyrogram idle().")
     await idle()
     await bot.stop()
 
