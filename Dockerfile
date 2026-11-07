@@ -1,21 +1,23 @@
-FROM python:3.10-slim
+FROM python:3.10-slim-bullseye
+
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-# Install system utilities: ffmpeg (for video/thumbnails/sample cut) and aria2 (for high-speed torrent/url download)
+# Install high-performance network and media binaries
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
     aria2 \
+    ffmpeg \
     curl \
-    git \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -U pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Hugging Face Spaces routes internal traffic through port 7860
-EXPOSE 7860
-
+# Railway automatically assigns PORT; health check binds to it
 CMD ["python", "main.py"]
