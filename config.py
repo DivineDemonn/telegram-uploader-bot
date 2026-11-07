@@ -1,30 +1,17 @@
 import os
-import sys
-
-def get_env(key: str, default=None, required: bool = False):
-    """Retrieve an environment variable or raise an error if required."""
-    val = os.getenv(key, default)
-    if required and (val is None or str(val).strip() == ""):
-        print(f"❌ CRITICAL CONFIG ERROR: Missing required environment variable '{key}' in Railway!")
-        sys.exit(1)
-    return val
 
 # Telegram API Credentials
-API_ID = int(get_env("API_ID", required=True))
-API_HASH = str(get_env("API_HASH", required=True))
-BOT_TOKEN = str(get_env("BOT_TOKEN", required=True))
+API_ID = int(os.getenv("API_ID", "27758016"))
+API_HASH = os.getenv("API_HASH", "8d34cfffe27ab461eabbf0091b1a27df")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8912039309:AAGHvO-9QtmhNzkpUOQjK-Ucxu8Y6qp_FwI")
 
-# Owner Identification
-OWNER_ID = int(get_env("OWNER_ID", required=True))
+# Master Owner ID
+OWNER_ID = int(os.getenv("OWNER_ID", "8738369449"))
 
-# Database Settings
-MONGO_URL = str(get_env("MONGO_URL", required=True))
-DB_NAME = str(get_env("DB_NAME", default="railway_uploader_bot"))
+# Railway Network Configuration
+PORT = int(os.getenv("PORT", "8080"))
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "telegram-uploader-bot-production-1845.up.railway.app")
 
-# Railway Networking & Health Check (Railway injects PORT automatically)
-PORT = int(get_env("PORT", default=8080))
-RAILWAY_PUBLIC_DOMAIN = get_env("RAILWAY_PUBLIC_DOMAIN", default="")
-
-# Ephemeral File Buffer Directory
+# Download Storage
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
