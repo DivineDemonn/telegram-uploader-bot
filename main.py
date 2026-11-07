@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_TASKS = {}
 
-# --- 1. Health Web Server ---
+# --- 1. Health Server ---
 async def ping_handler(request):
     return web.Response(text="Bot is running 24/7 on Railway!", status=200)
 
@@ -38,9 +38,8 @@ async def start_health_server():
     await site.start()
     logger.info(f"Health server listening on port {config.PORT}")
 
-# --- 2. 24/7 Keep-Alive Self Pinger ---
+# --- 2. Keep-Alive Worker ---
 async def keep_alive_worker():
-    """Periodically hits the Railway public domain to prevent network drops."""
     await asyncio.sleep(30)
     while True:
         url = os.getenv("RAILWAY_PUBLIC_DOMAIN")
@@ -52,24 +51,21 @@ async def keep_alive_worker():
                         logger.info(f"Keep-alive ping sent to {target} | Status: {resp.status}")
             except Exception as e:
                 logger.warning(f"Keep-alive ping error: {e}")
-        await asyncio.sleep(300)  # Ping every 5 minutes
+        await asyncio.sleep(300)
 
-# --- 3. Auto-Cleanup Worker for Stale Downloads ---
+# --- 3. Stale Temp File Cleaner ---
 async def stale_cleanup_worker():
-    """Wipes abandoned files older than 30 minutes to protect container disk space."""
     while True:
-        await asyncio.sleep(1800)  # Check every 30 minutes
+        await asyncio.sleep(1800)
         now = time.time()
         for root, dirs, files in os.walk(config.DOWNLOAD_DIR):
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
-                    # Remove file if modified more than 30 minutes ago
                     if os.path.exists(file_path) and (now - os.path.getmtime(file_path) > 1800):
                         os.remove(file_path)
-                        logger.info(f"Cleaned up stale file: {file_path}")
                 except Exception as e:
-                    logger.error(f"Cleanup error on file {file_path}: {e}")
+                    logger.error(f"Cleanup error on {file_path}: {e}")
 
 # --- 4. Pyrogram Bot Client ---
 bot = Client(
@@ -80,64 +76,83 @@ bot = Client(
     max_concurrent_transmissions=4
 )
 
-# --- 5. Handlers & Commands ---
+# --- 5. Diagnostic Handlers ---
 @bot.on_message(filters.command("start"))
 async def start_command(_, message: Message):
     user_id = message.from_user.id
-    if not await database.is_user_authorized(user_id):
-        return await message.reply_text("⛔ **Access Denied.** You are not authorized to use this bot.")
+    logger.info(f"📩 /start received from User ID: {user_id}")
+    
+    # Check authorization with a 3-second timeout fallback
+    try:
+        authorized = await asyncio.wait_for(database.is_user_authorized(user_id), timeout=3.0)
+    except Exception as e:
+        logger.error(f"Database check timed out or failed: {e}")
+        authorized = (user_id == config.OWNER_ID)
+
+    if not authorized:
+        return await message.reply_text(
+            f"⛔ **Access Denied.**\n"
+            f"Your Telegram ID: `{user_id}`\n\n"
+            f"Ask the bot owner (`{config.OWNER_ID}`) to authorize you with:\n"
+            f"`/auth {user_id}`"
+        )
     
     await message.reply_text(
-        f"⚡ **Uploader Bot Online (24/7 Mode)!**\n\n"
+        f"⚡ **Uploader Bot Online!**\n\n"
+        f"👤 **Your ID:** `{user_id}`\n"
+        f"👑 **Owner ID:** `{config.OWNER_ID}`\n\n"
         "Send me any of the following:\n"
-        "• Direct File URLs (`.mkv`, `.mp4`, zip files, tokenized links)\n"
+        "• Direct download URLs (`.mp4`, `.mkv`, etc.)\n"
         "• Magnet links (`magnet:?xt=...`)\n"
-        "• `.torrent` document files\n\n"
-        "Options will appear for **Video**, **File/Document**, or **Sample Clips**."
+        "• `.torrent` files"
     )
 
-@bot.on_message(filters.command("auth") & filters.user(config.OWNER_ID))
+@bot.on_message(filters.command("users"))
+async def users_command(_, message: Message):
+    user_id = message.from_user.id
+    logger.info(f"📩 /users requested by {user_id}")
+    if user_id != config.OWNER_ID:
+        return await message.reply_text(f"⛔ Only the owner (`{config.OWNER_ID}`) can view authorized users.")
+    
+    try:
+        users = await database.get_all_users()
+        reply = f"👑 **Owner ID:** `{config.OWNER_ID}`\n\n**Authorized Users:**\n"
+        if not users:
+            reply += "• _No extra authorized users._"
+        else:
+            reply += "\n".join([f"• `{uid}`" for uid in users])
+        await message.reply_text(reply)
+    except Exception as e:
+        await message.reply_text(f"❌ Database error: {e}")
+
+@bot.on_message(filters.command("auth"))
 async def auth_command(_, message: Message):
+    if message.from_user.id != config.OWNER_ID:
+        return await message.reply_text("⛔ Owner only command.")
     if len(message.command) < 2:
         return await message.reply_text("Usage: `/auth <user_id>`")
     try:
         target_id = int(message.command[1])
         if await database.authorize_user(target_id):
-            await message.reply_text(f"✅ User `{target_id}` added to authorized list.")
+            await message.reply_text(f"✅ User `{target_id}` authorized.")
         else:
             await message.reply_text("⚠️ User is already authorized.")
-    except ValueError:
-        await message.reply_text("Invalid User ID format.")
+    except Exception as e:
+        await message.reply_text(f"Error: {e}")
 
-@bot.on_message(filters.command("unauth") & filters.user(config.OWNER_ID))
-async def unauth_command(_, message: Message):
-    if len(message.command) < 2:
-        return await message.reply_text("Usage: `/unauth <user_id>`")
-    try:
-        target_id = int(message.command[1])
-        if await database.unauthorize_user(target_id):
-            await message.reply_text(f"🚫 User `{target_id}` removed from authorized list.")
-        else:
-            await message.reply_text("User was not found in authorized list.")
-    except ValueError:
-        await message.reply_text("Invalid User ID format.")
-
-@bot.on_message(filters.command("users") & filters.user(config.OWNER_ID))
-async def users_command(_, message: Message):
-    users = await database.get_all_users()
-    reply = f"👑 **Owner ID:** `{config.OWNER_ID}`\n\n**Authorized Users:**\n"
-    if not users:
-        reply += "• _No additional users authorized._"
-    else:
-        reply += "\n".join([f"• `{uid}`" for uid in users])
-    await message.reply_text(reply)
-
-# --- 6. Task Receiver ---
+# --- 6. Link Receiver ---
 @bot.on_message((filters.text | filters.document) & filters.private)
 async def incoming_handler(_, message: Message):
     user_id = message.from_user.id
-    if not await database.is_user_authorized(user_id):
-        return await message.reply_text("⛔ You are not authorized to use this bot.")
+    logger.info(f"📩 Incoming media/link from User ID: {user_id}")
+
+    try:
+        authorized = await asyncio.wait_for(database.is_user_authorized(user_id), timeout=3.0)
+    except Exception:
+        authorized = (user_id == config.OWNER_ID)
+
+    if not authorized:
+        return await message.reply_text(f"⛔ You are not authorized. Your ID is `{user_id}`.")
 
     uri = None
     if message.text:
@@ -169,14 +184,14 @@ async def incoming_handler(_, message: Message):
 
     await message.reply_text("⚡ **Source Accepted!** Select upload mode:", reply_markup=markup)
 
-# --- 7. Execution Pipeline ---
+# --- 7. Task Callbacks ---
 @bot.on_callback_query(filters.regex("^(up_vid|up_doc|sample_30|sample_60):"))
 async def process_task_callback(_, query: CallbackQuery):
     action, task_id = query.data.split(":")
     task = ACTIVE_TASKS.get(task_id)
 
     if not task:
-        return await query.answer("This task has expired or was already cleared.", show_alert=True)
+        return await query.answer("This task has expired or was cleared.", show_alert=True)
     if query.from_user.id != task["user_id"]:
         return await query.answer("You are not the initiator of this task.", show_alert=True)
 
@@ -269,13 +284,12 @@ async def process_task_callback(_, query: CallbackQuery):
         shutil.rmtree(task_dir, ignore_errors=True)
         ACTIVE_TASKS.pop(task_id, None)
 
-# --- 8. Persistent Main Loop ---
+# --- 8. Main Loop ---
 async def main():
     await start_health_server()
     asyncio.create_task(keep_alive_worker())
     asyncio.create_task(stale_cleanup_worker())
     
-    # Auto-reconnection loop: if Telegram disconnects, reconnect without stopping
     while True:
         try:
             logger.info("Starting Telegram Bot client...")
