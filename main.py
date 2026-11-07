@@ -11,7 +11,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
     CallbackQuery
 )
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 
 import config
 import database
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_TASKS = {}
 
-# --- 1. Railway Health Server ---
+# --- 1. Railway Health Web Server ---
 async def ping_handler(request):
     return web.Response(text="Bot is running 24/7 on Railway!", status=200)
 
@@ -67,7 +67,7 @@ async def stale_cleanup_worker():
                 except Exception:
                     pass
 
-# --- 4. Pyrogram Bot Instance ---
+# --- 4. Pyrogram Bot Client ---
 bot = Client(
     "railway_uploader_bot",
     api_id=config.API_ID,
@@ -83,17 +83,20 @@ async def start_command(_, message: Message):
     logger.info(f"📩 /start command received from User ID: {user_id}")
     
     is_owner = (user_id == config.OWNER_ID)
-    status_label = "👑 **OWNER**" if is_owner else "👤 **USER**"
+    status_label = "👑 **OWNER**" if is_owner else "👤 **AUTHORIZED USER**"
 
     await message.reply_text(
-        f"⚡ **Uploader Bot is Online!**\n\n"
+        f"⚡ **Uploader Bot is Online (24/7 Mode)!**\n\n"
         f"🆔 **Your Telegram ID:** `{user_id}`\n"
-        f"👑 **Configured Owner ID:** `{config.OWNER_ID}`\n"
+        f"👑 **Owner ID:** `{config.OWNER_ID}`\n"
         f"🔰 **Your Status:** {status_label}\n\n"
         "**Send me any of the following:**\n"
         "• Direct video / leech URLs (`.mkv`, `.mp4`)\n"
         "• Magnet links (`magnet:?xt=...`)\n"
-        "• `.torrent` files"
+        "• `.torrent` files\n\n"
+        "**Custom Sample Command:**\n"
+        "`/sample <start_time> <duration> <url>`\n"
+        "*(Example: `/sample 00:05:00 30 https://...` or reply to a link)*"
     )
 
 @bot.on_message(filters.command("auth") & filters.user(config.OWNER_ID))
@@ -129,7 +132,96 @@ async def users_command(_, message: Message):
     reply += "\n".join([f"• `{uid}`" for uid in users]) if users else "• _No extra authorized users._"
     await message.reply_text(reply)
 
-# --- 6. Media / Link Receiver ---
+# --- 6. Custom Timing /sample Command ---
+@bot.on_message(filters.command("sample") & filters.private)
+async def sample_command_handler(_, message: Message):
+    user_id = message.from_user.id
+    if not await database.is_user_authorized(user_id):
+        return await message.reply_text("⛔ You are not authorized to use this bot.")
+
+    args = message.command[1:]
+    start_time = "00:01:00"
+    duration = 30
+    uri = None
+
+    # Option A: Reply to an existing link or .torrent file
+    if message.reply_to_message:
+        replied = message.reply_to_message
+        if replied.text:
+            uri = replied.text.strip()
+        elif replied.document and replied.document.file_name.endswith(".torrent"):
+            uri = await replied.download(file_name=os.path.join(config.DOWNLOAD_DIR, f"{replied.id}.torrent"))
+        
+        if len(args) >= 1:
+            start_time = args[0]
+        if len(args) >= 2 and args[1].isdigit():
+            duration = int(args[1])
+
+    # Option B: /sample <start_time> <duration> <url>
+    elif len(args) >= 3:
+        start_time = args[0]
+        duration = int(args[1]) if args[1].isdigit() else 30
+        uri = args[2]
+
+    # Option C: /sample <start_time> <url>
+    elif len(args) == 2 and (args[1].startswith("http") or args[1].startswith("magnet:")):
+        start_time = args[0]
+        uri = args[1]
+
+    if not uri or not (uri.startswith("http://") or uri.startswith("https://") or uri.startswith("magnet:?") or os.path.exists(uri)):
+        return await message.reply_text(
+            "ℹ️ **How to use /sample:**\n\n"
+            "**Format:**\n"
+            "`/sample <start_time> <duration_sec> <link>`\n\n"
+            "**Example:**\n"
+            "`/sample 00:05:30 45 https://site.com/movie.mkv`\n\n"
+            "*(Or reply to any link/torrent message with `/sample 00:05:30 45`)*"
+        )
+
+    task_id = f"custom_sample_{message.id}"
+    task_dir = os.path.join(config.DOWNLOAD_DIR, task_id)
+    os.makedirs(task_dir, exist_ok=True)
+    status_msg = await message.reply_text(f"⏳ **Downloading source to slice {duration}s clip from `{start_time}`...**")
+
+    try:
+        downloaded_file = await download_content(uri, task_dir, status_msg)
+        if not downloaded_file or not os.path.exists(downloaded_file):
+            return await status_msg.edit_text("❌ Download failed or empty file received.")
+
+        await status_msg.edit_text(f"✂️ **Cropping sample clip:** `{start_time}` (+`{duration}s`)...")
+        
+        sample_output = os.path.join(task_dir, f"sample_{duration}s.mp4")
+        clip = await extract_sample_clip(downloaded_file, start_time, duration, sample_output)
+        
+        if not clip or not os.path.exists(clip):
+            return await status_msg.edit_text("❌ Failed to crop sample. Check if the start time exceeds video duration.")
+
+        sample_thumb = os.path.join(task_dir, "sample_thumb.jpg")
+        await generate_thumbnail(clip, sample_thumb, timestamp_sec=2)
+
+        tracker = ProgressTracker(status_msg, "Uploading Custom Sample")
+        await bot.send_video(
+            chat_id=message.chat.id,
+            video=clip,
+            caption=(
+                f"✂️ **Custom Sample Video**\n\n"
+                f"⏱️ **Start Time:** `{start_time}`\n"
+                f"⏳ **Duration:** `{duration}s`\n"
+                f"🎬 **Original:** `{os.path.basename(downloaded_file)}`"
+            ),
+            thumb=sample_thumb if os.path.exists(sample_thumb) else None,
+            supports_streaming=True,
+            progress=tracker.progress_callback
+        )
+        await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Custom sample error: {e}")
+        await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
+    finally:
+        shutil.rmtree(task_dir, ignore_errors=True)
+
+# --- 7. Media / Link Receiver ---
 @bot.on_message((filters.text | filters.document) & filters.private)
 async def incoming_handler(_, message: Message):
     user_id = message.from_user.id
@@ -165,16 +257,24 @@ async def incoming_handler(_, message: Message):
         [
             InlineKeyboardButton("✂️ 30s Sample Clip", callback_data=f"sample_30:{task_id}"),
             InlineKeyboardButton("⏱️ 60s Sample Clip", callback_data=f"sample_60:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel Task", callback_data=f"cancel:{task_id}")
         ]
     ])
 
     await message.reply_text("⚡ **Source Accepted!** Select upload mode:", reply_markup=markup)
 
-# --- 7. Task Callbacks ---
-@bot.on_callback_query(filters.regex("^(up_vid|up_doc|sample_30|sample_60):"))
+# --- 8. Task Callbacks ---
+@bot.on_callback_query(filters.regex("^(up_vid|up_doc|sample_30|sample_60|cancel):"))
 async def process_task_callback(_, query: CallbackQuery):
     action, task_id = query.data.split(":")
     task = ACTIVE_TASKS.get(task_id)
+
+    if action == "cancel":
+        ACTIVE_TASKS.pop(task_id, None)
+        await query.message.edit_text("❌ **Task Cancelled.**")
+        return await query.answer("Cancelled.")
 
     if not task:
         return await query.answer("This task expired.", show_alert=True)
@@ -198,6 +298,7 @@ async def process_task_callback(_, query: CallbackQuery):
         if file_size > (2000 * 1024 * 1024):
             return await status_msg.edit_text(f"❌ File size (`{file_size_human}`) exceeds Telegram's 2 GB limit.")
 
+        # Preset Sample Handling
         if action in ("sample_30", "sample_60"):
             sample_duration = 30 if action == "sample_30" else 60
             await status_msg.edit_text(f"✂️ **Extracting {sample_duration}s sample with ffmpeg...**")
@@ -224,6 +325,7 @@ async def process_task_callback(_, query: CallbackQuery):
             await status_msg.delete()
             return
 
+        # Video Upload
         if action == "up_vid":
             await status_msg.edit_text("🎞️ **Parsing metadata & uploading video...**")
             meta = await get_video_metadata(downloaded_file)
@@ -245,6 +347,7 @@ async def process_task_callback(_, query: CallbackQuery):
             await status_msg.delete()
             return
 
+        # Document Upload
         if action == "up_doc":
             thumb_path = os.path.join(task_dir, "thumb.jpg")
             await generate_thumbnail(downloaded_file, thumb_path, timestamp_sec=10)
@@ -262,6 +365,8 @@ async def process_task_callback(_, query: CallbackQuery):
 
     except FloodWait as f:
         await asyncio.sleep(f.value)
+    except MessageNotModified:
+        pass
     except Exception as e:
         logger.error(f"Task error: {e}")
         await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
@@ -269,14 +374,14 @@ async def process_task_callback(_, query: CallbackQuery):
         shutil.rmtree(task_dir, ignore_errors=True)
         ACTIVE_TASKS.pop(task_id, None)
 
-# --- 8. Runner ---
+# --- 9. Startup Runner ---
 async def start_all():
     await start_health_server()
     asyncio.create_task(keep_alive_worker())
     asyncio.create_task(stale_cleanup_worker())
     logger.info("Starting Pyrogram bot...")
     await bot.start()
-    logger.info("Bot is listening for messages via Pyrogram idle().")
+    logger.info("Bot is running and actively listening for updates.")
     await idle()
     await bot.stop()
 
