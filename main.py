@@ -1,6 +1,6 @@
 import asyncio
 
-# Initialize event loop before Pyrogram imports to prevent Python 3.12+ crash
+# Initialize event loop before Pyrogram imports to prevent Python 3.12+ crashes
 try:
     asyncio.get_event_loop()
 except RuntimeError:
@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_TASKS = {}
 
-# --- 1. Periodic Temp Storage Cleaner ---
+# --- 1. Storage Cleaner Worker ---
 async def disk_cleanup_worker():
-    """Wipes orphaned files older than 30 minutes to preserve dyno disk."""
+    """Wipes orphaned files older than 30 minutes to preserve Heroku dyno storage."""
     while True:
         await asyncio.sleep(1800)
         now = time.time()
@@ -49,14 +49,14 @@ async def disk_cleanup_worker():
 
 # --- 2. Pyrogram Client ---
 bot = Client(
-    "heroku_uploader_bot",
+    "telegram_uploader_bot",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     max_concurrent_transmissions=4
 )
 
-# --- 3. Timing & Range Parser Helper ---
+# --- 3. Timing Parser Helpers ---
 def parse_time_seconds(time_val: str) -> int:
     if not time_val:
         return 0
@@ -94,7 +94,7 @@ def parse_sample_arguments(args: list):
     if not raw_timing:
         return start_str, duration, extracted_uri
 
-    # Format: "00:05:00 to 00:05:55"
+    # Handles: "00:05:00 to 00:05:55"
     if " to " in raw_timing.lower():
         parts = re.split(r"\s+to\s+", raw_timing, flags=re.IGNORECASE)
         if len(parts) == 2:
@@ -103,7 +103,7 @@ def parse_sample_arguments(args: list):
             dur = (e_sec - s_sec) if e_sec > s_sec else 30
             return format_seconds(s_sec), dur, extracted_uri
 
-    # Format: "00:05:00 - 00:05:55"
+    # Handles: "00:05:00 - 00:05:55"
     if "-" in raw_timing and not raw_timing.startswith("-"):
         parts = raw_timing.split("-")
         if len(parts) == 2:
@@ -112,7 +112,7 @@ def parse_sample_arguments(args: list):
             dur = (e_sec - s_sec) if e_sec > s_sec else 30
             return format_seconds(s_sec), dur, extracted_uri
 
-    # Format: "00:05:00 45"
+    # Handles: "00:05:00 45"
     if len(clean_args) >= 2:
         arg1, arg2 = clean_args[0], clean_args[1]
         s_sec = parse_time_seconds(arg1)
@@ -133,7 +133,7 @@ def parse_sample_arguments(args: list):
 
     return start_str, duration, extracted_uri
 
-# --- 4. Core Bot Commands ---
+# --- 4. User Commands ---
 @bot.on_message(filters.command("start"))
 async def start_command(_, message: Message):
     user_id = message.from_user.id
@@ -230,13 +230,15 @@ async def sample_command_handler(_, message: Message):
 
     try:
         downloaded_file = None
+        original_title = "Video File"
 
         if telegram_target:
-            await status_msg.edit_text("📥 **Downloading source video from Telegram servers...**")
+            await status_msg.edit_text("📥 **Downloading source video from Telegram...**")
             tracker = ProgressTracker(status_msg, "Telegram Media Download")
             media_obj = telegram_target.video or telegram_target.document
-            raw_name = getattr(media_obj, "file_name", None) or f"video_{telegram_target.id}.mp4"
-            dest_path = os.path.join(task_dir, raw_name)
+            original_title = getattr(media_obj, "file_name", None) or f"video_{telegram_target.id}.mkv"
+            ext = os.path.splitext(original_title)[1] or ".mkv"
+            dest_path = os.path.join(task_dir, f"source_input{ext}")
             
             downloaded_file = await telegram_target.download(
                 file_name=dest_path,
@@ -244,6 +246,8 @@ async def sample_command_handler(_, message: Message):
             )
         elif uri:
             downloaded_file = await download_content(uri, task_dir, status_msg)
+            if downloaded_file:
+                original_title = os.path.basename(downloaded_file)
 
         if not downloaded_file or not os.path.exists(downloaded_file):
             return await status_msg.edit_text("❌ Failed to obtain source video.")
@@ -254,7 +258,14 @@ async def sample_command_handler(_, message: Message):
         clip = await extract_sample_clip(downloaded_file, start_time, duration, sample_output)
         
         if not clip or not os.path.exists(clip):
-            return await status_msg.edit_text("❌ Failed to crop sample. Ensure timestamp is within video duration.")
+            return await status_msg.edit_text("❌ Failed to crop sample. Check if timestamp exceeds video duration.")
+
+        # Immediately remove large source video to free Heroku ephemeral disk
+        try:
+            if os.path.exists(downloaded_file):
+                os.remove(downloaded_file)
+        except Exception:
+            pass
 
         sample_thumb = os.path.join(task_dir, "sample_thumb.jpg")
         await generate_thumbnail(clip, sample_thumb, timestamp_sec=2)
@@ -267,7 +278,7 @@ async def sample_command_handler(_, message: Message):
                 f"✂️ **Sample Video ({duration}s)**\n\n"
                 f"⏱️ **Timestamp:** `{start_time}`\n"
                 f"⏳ **Duration:** `{duration}s`\n"
-                f"🎬 **Source File:** `{os.path.basename(downloaded_file)}`"
+                f"🎬 **Source:** `{original_title}`"
             ),
             thumb=sample_thumb if os.path.exists(sample_thumb) else None,
             supports_streaming=True,
@@ -323,7 +334,6 @@ async def intake_handler(_, message: Message):
         "user_id": user_id
     }
 
-    # Attractive, streamlined action keyboard
     markup = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎬 Video (Fast Stream)", callback_data=f"up_vid:{task_id}"),
@@ -364,12 +374,14 @@ async def process_task_callback(_, query: CallbackQuery):
 
     try:
         downloaded_file = None
+        original_name = "Video File"
 
         if task.get("is_tg_file"):
             orig_msg = task["message"]
             media = orig_msg.video or orig_msg.document
-            file_name = getattr(media, "file_name", None) or f"video_{orig_msg.id}.mp4"
-            dest_path = os.path.join(task_dir, file_name)
+            original_name = getattr(media, "file_name", None) or f"video_{orig_msg.id}.mkv"
+            ext = os.path.splitext(original_name)[1] or ".mkv"
+            dest_path = os.path.join(task_dir, f"source_input{ext}")
             tracker = ProgressTracker(status_msg, "Telegram Media Download")
             downloaded_file = await orig_msg.download(
                 file_name=dest_path,
@@ -377,6 +389,8 @@ async def process_task_callback(_, query: CallbackQuery):
             )
         else:
             downloaded_file = await download_content(task["uri"], task_dir, status_msg)
+            if downloaded_file:
+                original_name = os.path.basename(downloaded_file)
 
         if not downloaded_file or not os.path.exists(downloaded_file):
             return await status_msg.edit_text("❌ Download failed or empty file received.")
@@ -387,16 +401,25 @@ async def process_task_callback(_, query: CallbackQuery):
         if file_size > (2000 * 1024 * 1024):
             return await status_msg.edit_text(f"❌ File size (`{file_size_human}`) exceeds Telegram's 2 GB limit.")
 
+        # Preset Sample Handling
         if action in ("sample_30", "sample_60"):
             sample_duration = 30 if action == "sample_30" else 60
             await status_msg.edit_text(f"✂️ **Extracting {sample_duration}s preview clip with ffmpeg...**")
             meta = await get_video_metadata(downloaded_file)
+            
             start_timestamp = 60 if meta["duration"] > (sample_duration + 60) else 5
             sample_output = os.path.join(task_dir, f"sample_{sample_duration}s.mp4")
             
-            clip = await extract_sample_clip(downloaded_file, start_timestamp, sample_duration, sample_output)
+            clip = await extract_sample_clip(downloaded_file, format_seconds(start_timestamp), sample_duration, sample_output)
             if not clip:
                 return await status_msg.edit_text("❌ Failed to slice video clip.")
+
+            # Free disk space
+            try:
+                if os.path.exists(downloaded_file):
+                    os.remove(downloaded_file)
+            except Exception:
+                pass
 
             sample_thumb = os.path.join(task_dir, "sample_thumb.jpg")
             await generate_thumbnail(clip, sample_thumb, timestamp_sec=2)
@@ -405,7 +428,7 @@ async def process_task_callback(_, query: CallbackQuery):
             await bot.send_video(
                 chat_id=query.message.chat.id,
                 video=clip,
-                caption=f"✂️ **Sample ({sample_duration}s)**\nSource: `{os.path.basename(downloaded_file)}`",
+                caption=f"✂️ **Sample ({sample_duration}s)**\nSource: `{original_name}`",
                 thumb=sample_thumb if os.path.exists(sample_thumb) else None,
                 supports_streaming=True,
                 progress=tracker.progress_callback
@@ -413,6 +436,7 @@ async def process_task_callback(_, query: CallbackQuery):
             await status_msg.delete()
             return
 
+        # Full Video Upload
         if action == "up_vid":
             await status_msg.edit_text("🎞️ **Generating video thumbnail & parsing parameters...**")
             meta = await get_video_metadata(downloaded_file)
@@ -423,7 +447,7 @@ async def process_task_callback(_, query: CallbackQuery):
             await bot.send_video(
                 chat_id=query.message.chat.id,
                 video=downloaded_file,
-                caption=f"🎬 `{os.path.basename(downloaded_file)}`\n📦 **Size:** `{file_size_human}`",
+                caption=f"🎬 `{original_name}`\n📦 **Size:** `{file_size_human}`",
                 duration=meta["duration"],
                 width=meta["width"],
                 height=meta["height"],
@@ -434,6 +458,7 @@ async def process_task_callback(_, query: CallbackQuery):
             await status_msg.delete()
             return
 
+        # Document Upload
         if action == "up_doc":
             thumb_path = os.path.join(task_dir, "thumb.jpg")
             await generate_thumbnail(downloaded_file, thumb_path, timestamp_sec=10)
@@ -442,7 +467,7 @@ async def process_task_callback(_, query: CallbackQuery):
             await bot.send_document(
                 chat_id=query.message.chat.id,
                 document=downloaded_file,
-                caption=f"📁 `{os.path.basename(downloaded_file)}`\n📦 **Size:** `{file_size_human}`",
+                caption=f"📁 `{original_name}`\n📦 **Size:** `{file_size_human}`",
                 thumb=thumb_path if os.path.exists(thumb_path) else None,
                 progress=tracker.progress_callback
             )
