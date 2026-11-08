@@ -5,7 +5,6 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system dependencies on Debian Bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     aria2 \
     ffmpeg \
@@ -19,4 +18,5 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
 
 COPY . .
 
+# Run worker process
 CMD ["python", "main.py"]
