@@ -1,48 +1,76 @@
-import json
-import os
+import logging
+from motor.motor_asyncio import AsyncIOMotorClient
 import config
 
-DB_FILE = "authorized_users.json"
+logger = logging.getLogger(__name__)
 
-def _load_users() -> list:
-    if not os.path.exists(DB_FILE):
-        return [config.OWNER_ID]
-    try:
-        with open(DB_FILE, "r") as f:
-            users = json.load(f)
-            if config.OWNER_ID not in users:
-                users.append(config.OWNER_ID)
-            return users
-    except Exception:
-        return [config.OWNER_ID]
+# Fail-safe 5000ms connection timeout to eliminate hanging bugs
+client = AsyncIOMotorClient(config.MONGO_URL, serverSelectionTimeoutMS=5000)
+db = client[config.DB_NAME]
+users_col = db["allowed_users"]
 
-def _save_users(users: list):
-    try:
-        with open(DB_FILE, "w") as f:
-            json.dump(users, f, indent=2)
-    except Exception as e:
-        print(f"Error saving users: {e}")
-
-async def is_user_authorized(user_id: int) -> bool:
+async def is_user_authorized(user_id: int, username: str = None) -> bool:
+    """Checks if a user is the owner or explicitly whitelisted."""
     if user_id == config.OWNER_ID:
         return True
-    return user_id in _load_users()
+    try:
+        query = {"$or": [{"user_id": user_id}]}
+        if username:
+            query["$or"].append({"username": username.lower().replace("@", "")})
+        user = await users_col.find_one(query)
+        return user is not None
+    except Exception as e:
+        logger.error(f"MongoDB authorization lookup error: {e}")
+        # Default fallback to owner only if DB is unreachable
+        return user_id == config.OWNER_ID
 
-async def authorize_user(user_id: int) -> bool:
-    users = _load_users()
-    if user_id in users:
-        return False
-    users.append(user_id)
-    _save_users(users)
-    return True
+async def authorize_user(identifier: str) -> tuple[bool, str]:
+    """Adds a User ID or @Username to the database whitelist."""
+    try:
+        clean = identifier.strip().replace("@", "")
+        if clean.isdigit():
+            user_id = int(clean)
+            existing = await users_col.find_one({"user_id": user_id})
+            if existing:
+                return False, f"User ID `{user_id}` is already authorized."
+            await users_col.insert_one({"user_id": user_id, "username": None})
+            return True, f"User ID `{user_id}` successfully authorized."
+        else:
+            uname = clean.lower()
+            existing = await users_col.find_one({"username": uname})
+            if existing:
+                return False, f"Username `@{uname}` is already authorized."
+            await users_col.insert_one({"user_id": None, "username": uname})
+            return True, f"Username `@{uname}` successfully authorized."
+    except Exception as e:
+        logger.error(f"MongoDB insert error: {e}")
+        return False, f"Database error: {e}"
 
-async def unauthorize_user(user_id: int) -> bool:
-    users = _load_users()
-    if user_id in users:
-        users.remove(user_id)
-        _save_users(users)
-        return True
-    return False
+async def unauthorize_user(identifier: str) -> tuple[bool, str]:
+    """Removes a User ID or @Username from the database."""
+    try:
+        clean = identifier.strip().replace("@", "")
+        if clean.isdigit():
+            res = await users_col.delete_one({"user_id": int(clean)})
+        else:
+            res = await users_col.delete_one({"username": clean.lower()})
+        
+        if res.deleted_count > 0:
+            return True, f"Access revoked for `{identifier}`."
+        return False, f"`{identifier}` was not found in authorized list."
+    except Exception as e:
+        return False, f"Database error: {e}"
 
-async def get_all_users() -> list:
-    return _load_users()
+async def get_all_authorized_users() -> list:
+    """Returns all whitelisted records."""
+    try:
+        records = []
+        async for doc in users_col.find():
+            if doc.get("user_id"):
+                records.append(f"`{doc['user_id']}`")
+            elif doc.get("username"):
+                records.append(f"@{doc['username']}")
+        return records
+    except Exception as e:
+        logger.error(f"Error fetching authorized list: {e}")
+        return []
