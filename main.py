@@ -1,8 +1,16 @@
+import asyncio
+
+# Initialize event loop before Pyrogram imports to prevent Python 3.12+ crash
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import os
 import re
 import time
 import shutil
-import asyncio
 import logging
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
