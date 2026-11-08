@@ -12,7 +12,7 @@ BOT_TOKEN = str(get_env("BOT_TOKEN", "8912039309:AAGHvO-9QtmhNzkpUOQjK-Ucxu8Y6qp
 OWNER_ID = int(get_env("OWNER_ID", "8738369449"))
 
 # MongoDB Configuration
-MONGO_URL = str(get_env("MONGO_URL", "mongodb+srv://marwin2002:marwin2002@cluster0.uavio6c.mongodb.net/"))
+MONGO_URL = str(get_env("MONGO_URL", "mongodb+srv://kevin11rpg2002:kevin11rpg2002@cluster0.xzxtqzb.mongodb.net/?retryWrites=true&w=majority"))
 DB_NAME = str(get_env("DB_NAME", "telegram_uploader_bot"))
 
 # Storage paths
