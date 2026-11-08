@@ -31,7 +31,7 @@ async def get_video_metadata(file_path: str):
         logger.error(f"FFprobe metadata error: {e}")
         return {"width": 1280, "height": 720, "duration": 0}
 
-async def generate_thumbnail(video_path: str, thumb_path: str, timestamp_sec: int = 10):
+async def generate_thumbnail(video_path: str, thumb_path: str, timestamp_sec: int = 15):
     cmd = [
         "ffmpeg",
         "-ss", str(timestamp_sec),
@@ -47,7 +47,7 @@ async def generate_thumbnail(video_path: str, thumb_path: str, timestamp_sec: in
 
 async def extract_sample_clip(video_path: str, start_time: str, duration: int, output_path: str):
     """
-    First attempts stream-copying for instant extraction; falls back to ultrafast re-encode.
+    Attempts instant stream copy; falls back to ultrafast libx264 re-encoding.
     """
     cmd = [
         "ffmpeg",
