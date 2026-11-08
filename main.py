@@ -4,7 +4,6 @@ import time
 import shutil
 import asyncio
 import logging
-from aiohttp import web, ClientSession
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
     Message,
@@ -25,41 +24,13 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_TASKS = {}
 
-# --- 1. Railway Health Web Server ---
-async def ping_handler(request):
-    return web.Response(text="Bot is running 24/7 on Railway!", status=200)
-
-async def start_health_server():
-    app = web.Application()
-    app.router.add_get("/", ping_handler)
-    app.router.add_get("/health", ping_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", config.PORT)
-    await site.start()
-    logger.info(f"Health server listening on port {config.PORT}")
-
-# --- 2. Keep-Alive Worker ---
-async def keep_alive_worker():
-    await asyncio.sleep(20)
-    while True:
-        url = config.RAILWAY_PUBLIC_DOMAIN
-        if url:
-            target = f"https://{url}/health" if not url.startswith("http") else f"{url}/health"
-            try:
-                async with ClientSession() as session:
-                    async with session.get(target, timeout=10) as resp:
-                        logger.info(f"Keep-alive ping to {target} | Status: {resp.status}")
-            except Exception as e:
-                logger.warning(f"Keep-alive ping error: {e}")
-        await asyncio.sleep(300)
-
-# --- 3. Temp File Cleaner ---
-async def stale_cleanup_worker():
+# --- 1. Periodic Temp Storage Cleaner ---
+async def disk_cleanup_worker():
+    """Wipes orphaned files older than 30 minutes to preserve dyno disk."""
     while True:
         await asyncio.sleep(1800)
         now = time.time()
-        for root, dirs, files in os.walk(config.DOWNLOAD_DIR):
+        for root, _, files in os.walk(config.DOWNLOAD_DIR):
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
@@ -68,16 +39,16 @@ async def stale_cleanup_worker():
                 except Exception:
                     pass
 
-# --- 4. Pyrogram Bot Instance ---
+# --- 2. Pyrogram Client ---
 bot = Client(
-    "railway_uploader_bot",
+    "heroku_uploader_bot",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     max_concurrent_transmissions=4
 )
 
-# --- Helper: Robust Timing & Input Parser ---
+# --- 3. Timing & Range Parser Helper ---
 def parse_time_seconds(time_val: str) -> int:
     if not time_val:
         return 0
@@ -93,7 +64,7 @@ def parse_time_seconds(time_val: str) -> int:
         return 0
     return 0
 
-def format_seconds_to_timestamp(seconds: int) -> str:
+def format_seconds(seconds: int) -> str:
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
@@ -115,133 +86,120 @@ def parse_sample_arguments(args: list):
     if not raw_timing:
         return start_str, duration, extracted_uri
 
-    # Handles "00:05:00 to 00:05:55" or "5:00 to 5:55"
+    # Format: "00:05:00 to 00:05:55"
     if " to " in raw_timing.lower():
         parts = re.split(r"\s+to\s+", raw_timing, flags=re.IGNORECASE)
         if len(parts) == 2:
             s_sec = parse_time_seconds(parts[0])
             e_sec = parse_time_seconds(parts[1])
             dur = (e_sec - s_sec) if e_sec > s_sec else 30
-            return format_seconds_to_timestamp(s_sec), dur, extracted_uri
+            return format_seconds(s_sec), dur, extracted_uri
 
-    # Handles "00:05:00 - 00:05:55"
+    # Format: "00:05:00 - 00:05:55"
     if "-" in raw_timing and not raw_timing.startswith("-"):
         parts = raw_timing.split("-")
         if len(parts) == 2:
             s_sec = parse_time_seconds(parts[0])
             e_sec = parse_time_seconds(parts[1])
             dur = (e_sec - s_sec) if e_sec > s_sec else 30
-            return format_seconds_to_timestamp(s_sec), dur, extracted_uri
+            return format_seconds(s_sec), dur, extracted_uri
 
-    # Handles "00:05:00 55"
+    # Format: "00:05:00 45"
     if len(clean_args) >= 2:
         arg1, arg2 = clean_args[0], clean_args[1]
         s_sec = parse_time_seconds(arg1)
         if ":" in arg2:
             e_sec = parse_time_seconds(arg2)
             dur = (e_sec - s_sec) if e_sec > s_sec else 30
-            return format_seconds_to_timestamp(s_sec), dur, extracted_uri
+            return format_seconds(s_sec), dur, extracted_uri
         elif arg2.isdigit():
-            return format_seconds_to_timestamp(s_sec), int(arg2), extracted_uri
+            return format_seconds(s_sec), int(arg2), extracted_uri
 
-    # Handles single argument "00:05:00" or "45"
+    # Single argument: "00:05:00" or "45"
     if len(clean_args) == 1:
         arg = clean_args[0]
         if ":" in arg:
-            s_sec = parse_time_seconds(arg)
-            return format_seconds_to_timestamp(s_sec), 30, extracted_uri
+            return format_seconds(parse_time_seconds(arg)), 30, extracted_uri
         elif arg.isdigit():
             return "00:01:00", int(arg), extracted_uri
 
     return start_str, duration, extracted_uri
 
-# --- 5. Message Handlers ---
+# --- 4. Core Bot Commands ---
 @bot.on_message(filters.command("start"))
 async def start_command(_, message: Message):
     user_id = message.from_user.id
-    logger.info(f"📩 /start command received from User ID: {user_id}")
-    
+    username = message.from_user.username
     is_owner = (user_id == config.OWNER_ID)
-    status_label = "OWNER" if is_owner else "AUTHORIZED USER"
+    
+    authorized = await database.is_user_authorized(user_id, username)
+    status_badge = "👑 **OWNER**" if is_owner else ("✅ **AUTHORIZED**" if authorized else "⛔ **UNAUTHORIZED**")
 
-    text = (
-        f"⚡ **Uploader Bot is Online (24/7 Mode)!**\n\n"
-        f"🆔 **Your Telegram ID:** `{user_id}`\n"
+    ui_text = (
+        f"⚡ **High-Speed Leech & Uploader Bot**\n\n"
+        f"🆔 **Your User ID:** `{user_id}`\n"
         f"👑 **Owner ID:** `{config.OWNER_ID}`\n"
-        f"🔰 **Your Status:** **{status_label}**\n\n"
-        "**Send or forward any of the following:**\n"
-        "• Telegram Video / Document (.mkv, .mp4)\n"
-        "• Direct Download URLs (.mkv, .mp4)\n"
+        f"🔰 **Access Status:** {status_badge}\n\n"
+        "**Supported Inputs:**\n"
+        "• Direct Download Links (`.mp4`, `.mkv`, zip files)\n"
         "• Magnet links (`magnet:?xt=...`)\n"
-        "• .torrent files\n\n"
+        "• `.torrent` files\n"
+        "• Forwarded Telegram Videos & Documents\n\n"
         "**Sample Video Commands:**\n"
         "• Reply to any file or link with:\n"
         "  `/sample 00:05:00 to 00:05:55`\n"
         "  `/sample 00:05:00 45`\n"
-        "• Or send with direct link:\n"
+        "• Or send direct with link:\n"
         "  `/sample 00:05:00 30 [link]`"
     )
-    await message.reply_text(text)
+    await message.reply_text(ui_text)
 
-@bot.on_message(filters.command("auth") & filters.user(config.OWNER_ID))
-async def auth_command(_, message: Message):
+@bot.on_message(filters.command(["allow", "auth"]) & filters.user(config.OWNER_ID))
+async def allow_command(_, message: Message):
     if len(message.command) < 2:
-        return await message.reply_text("Usage: `/auth [user_id]`")
-    try:
-        target_id = int(message.command[1])
-        if await database.authorize_user(target_id):
-            await message.reply_text(f"✅ User `{target_id}` authorized.")
-        else:
-            await message.reply_text("⚠️ User is already authorized.")
-    except ValueError:
-        await message.reply_text("Invalid User ID.")
+        return await message.reply_text("Usage:\n`/allow 123456789`\nor\n`/allow @username`")
+    target = message.command[1]
+    success, msg = await database.authorize_user(target)
+    await message.reply_text(msg)
 
-@bot.on_message(filters.command("unauth") & filters.user(config.OWNER_ID))
-async def unauth_command(_, message: Message):
+@bot.on_message(filters.command(["ban", "unauth"]) & filters.user(config.OWNER_ID))
+async def ban_command(_, message: Message):
     if len(message.command) < 2:
-        return await message.reply_text("Usage: `/unauth [user_id]`")
-    try:
-        target_id = int(message.command[1])
-        if await database.unauthorize_user(target_id):
-            await message.reply_text(f"🚫 User `{target_id}` unauthorized.")
-        else:
-            await message.reply_text("User was not found in authorized list.")
-    except ValueError:
-        await message.reply_text("Invalid User ID.")
+        return await message.reply_text("Usage:\n`/ban 123456789`\nor\n`/ban @username`")
+    target = message.command[1]
+    success, msg = await database.unauthorize_user(target)
+    await message.reply_text(msg)
 
 @bot.on_message(filters.command("users") & filters.user(config.OWNER_ID))
 async def users_command(_, message: Message):
-    users = await database.get_all_users()
-    reply = f"👑 **Owner ID:** `{config.OWNER_ID}`\n\n**Authorized Users:**\n"
-    reply += "\n".join([f"• `{uid}`" for uid in users]) if users else "• _No extra authorized users._"
+    users = await database.get_all_authorized_users()
+    reply = f"👑 **Master Owner ID:** `{config.OWNER_ID}`\n\n**MongoDB Whitelisted Users:**\n"
+    reply += "\n".join([f"• {u}" for u in users]) if users else "• _No external users whitelisted._"
     await message.reply_text(reply)
 
-# --- 6. Smart /sample Command ---
+# --- 5. Custom /sample Video Handler ---
 @bot.on_message(filters.command("sample") & filters.private)
 async def sample_command_handler(_, message: Message):
     user_id = message.from_user.id
-    if not await database.is_user_authorized(user_id):
+    username = message.from_user.username
+    if not await database.is_user_authorized(user_id, username):
         return await message.reply_text("⛔ You are not authorized to use this bot.")
 
     args = message.command[1:]
     start_time, duration, uri = parse_sample_arguments(args)
     telegram_target = None
 
-    # Check if replying to an existing Telegram message
     if message.reply_to_message:
         replied = message.reply_to_message
-        
-        # Replying to a Telegram video or document (.mkv, .mp4, etc.)
         if replied.video or replied.document:
             if replied.document and replied.document.file_name and replied.document.file_name.lower().endswith(".torrent"):
                 uri = await replied.download(file_name=os.path.join(config.DOWNLOAD_DIR, f"{replied.id}.torrent"))
             else:
                 telegram_target = replied
         
-        # Replying to a text message or caption with a URL
         if not telegram_target and not uri:
-            target_text = replied.text or replied.caption or ""
-            for word in target_text.split():
+            text = replied.text or replied.caption or ""
+            for word in text.split():
                 if word.startswith("http://") or word.startswith("https://") or word.startswith("magnet:?"):
                     uri = word.strip()
                     break
@@ -249,7 +207,7 @@ async def sample_command_handler(_, message: Message):
     if not uri and not telegram_target:
         return await message.reply_text(
             "ℹ️ **How to use /sample:**\n\n"
-            "**1. Reply to any Telegram video / .mkv file:**\n"
+            "**1. Reply to any video / .mkv file in Telegram:**\n"
             "`/sample 00:05:00 to 00:05:55`\n"
             "`/sample 00:05:00 45`\n\n"
             "**2. With a direct link or magnet:**\n"
@@ -266,8 +224,8 @@ async def sample_command_handler(_, message: Message):
         downloaded_file = None
 
         if telegram_target:
-            await status_msg.edit_text("📥 **Downloading Telegram video to server...**")
-            tracker = ProgressTracker(status_msg, "Downloading Telegram File")
+            await status_msg.edit_text("📥 **Downloading source video from Telegram servers...**")
+            tracker = ProgressTracker(status_msg, "Telegram Media Download")
             media_obj = telegram_target.video or telegram_target.document
             raw_name = getattr(media_obj, "file_name", None) or f"video_{telegram_target.id}.mp4"
             dest_path = os.path.join(task_dir, raw_name)
@@ -282,25 +240,26 @@ async def sample_command_handler(_, message: Message):
         if not downloaded_file or not os.path.exists(downloaded_file):
             return await status_msg.edit_text("❌ Failed to obtain source video.")
 
-        await status_msg.edit_text(f"✂️ **Cropping sample clip:** `{start_time}` (+`{duration}s`)...")
+        await status_msg.edit_text(f"✂️ **Slicing clip:** `{start_time}` (+`{duration}s`)...")
         
         sample_output = os.path.join(task_dir, f"sample_{duration}s.mp4")
         clip = await extract_sample_clip(downloaded_file, start_time, duration, sample_output)
         
         if not clip or not os.path.exists(clip):
-            return await status_msg.edit_text("❌ Failed to crop sample. Check if the start time exceeds video duration.")
+            return await status_msg.edit_text("❌ Failed to crop sample. Ensure timestamp is within video duration.")
 
         sample_thumb = os.path.join(task_dir, "sample_thumb.jpg")
         await generate_thumbnail(clip, sample_thumb, timestamp_sec=2)
 
-        tracker = ProgressTracker(status_msg, "Uploading Custom Sample")
+        tracker = ProgressTracker(status_msg, "Uploading Sample Clip")
         await bot.send_video(
             chat_id=message.chat.id,
             video=clip,
             caption=(
-                f"✂️ **Sample Clip ({duration}s)**\n\n"
-                f"⏱️ **Interval:** `{start_time}` (Duration: `{duration}s`)\n"
-                f"🎬 **Original:** `{os.path.basename(downloaded_file)}`"
+                f"✂️ **Sample Video ({duration}s)**\n\n"
+                f"⏱️ **Timestamp:** `{start_time}`\n"
+                f"⏳ **Duration:** `{duration}s`\n"
+                f"🎬 **Source File:** `{os.path.basename(downloaded_file)}`"
             ),
             thumb=sample_thumb if os.path.exists(sample_thumb) else None,
             supports_streaming=True,
@@ -309,24 +268,22 @@ async def sample_command_handler(_, message: Message):
         await status_msg.delete()
 
     except Exception as e:
-        logger.error(f"Sample error: {e}")
+        logger.error(f"Sample slicing error: {e}")
         await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
 
-# --- 7. Incoming Media & Link Handler ---
+# --- 6. Incoming Media & Link Intake ---
 @bot.on_message((filters.text | filters.document | filters.video) & filters.private)
-async def incoming_handler(_, message: Message):
-    # Ignore slash commands so they don't trigger download prompt
+async def intake_handler(_, message: Message):
     if message.text and message.text.startswith("/"):
         return
 
     user_id = message.from_user.id
-    logger.info(f"📩 Incoming media/link from User ID: {user_id}")
-
-    if not await database.is_user_authorized(user_id):
+    username = message.from_user.username
+    if not await database.is_user_authorized(user_id, username):
         return await message.reply_text(
-            f"⛔ **Access Denied.**\nYour ID: `{user_id}`\nAsk owner (`{config.OWNER_ID}`) to authorize you."
+            f"⛔ **Access Denied.**\nYour ID: `{user_id}`\nAsk owner (`{config.OWNER_ID}`) to `/allow {user_id}`"
         )
 
     uri = None
@@ -358,23 +315,24 @@ async def incoming_handler(_, message: Message):
         "user_id": user_id
     }
 
+    # Attractive, streamlined action keyboard
     markup = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎬 Video (Fast Stream)", callback_data=f"up_vid:{task_id}"),
             InlineKeyboardButton("📁 Raw Document", callback_data=f"up_doc:{task_id}")
         ],
         [
-            InlineKeyboardButton("✂️ 30s Sample Clip", callback_data=f"sample_30:{task_id}"),
-            InlineKeyboardButton("⏱️ 60s Sample Clip", callback_data=f"sample_60:{task_id}")
+            InlineKeyboardButton("✂️ 30s Sample", callback_data=f"sample_30:{task_id}"),
+            InlineKeyboardButton("⏱️ 60s Sample", callback_data=f"sample_60:{task_id}")
         ],
         [
             InlineKeyboardButton("❌ Cancel Task", callback_data=f"cancel:{task_id}")
         ]
     ])
 
-    await message.reply_text("⚡ **Source Accepted!** Select upload mode:", reply_markup=markup)
+    await message.reply_text("⚡ **Source Accepted!** Choose upload mode:", reply_markup=markup)
 
-# --- 8. Task Callbacks ---
+# --- 7. Interactive Callback Engine ---
 @bot.on_callback_query(filters.regex("^(up_vid|up_doc|sample_30|sample_60|cancel):"))
 async def process_task_callback(_, query: CallbackQuery):
     action, task_id = query.data.split(":")
@@ -391,7 +349,7 @@ async def process_task_callback(_, query: CallbackQuery):
         return await query.answer("You didn't initiate this task.", show_alert=True)
 
     await query.message.edit_reply_markup(reply_markup=None)
-    status_msg = await query.message.reply_text("🚀 **Initializing process...**")
+    status_msg = await query.message.reply_text("🚀 **Initializing high-speed process...**")
     
     task_dir = os.path.join(config.DOWNLOAD_DIR, f"task_{task_id}")
     os.makedirs(task_dir, exist_ok=True)
@@ -404,7 +362,7 @@ async def process_task_callback(_, query: CallbackQuery):
             media = orig_msg.video or orig_msg.document
             file_name = getattr(media, "file_name", None) or f"video_{orig_msg.id}.mp4"
             dest_path = os.path.join(task_dir, file_name)
-            tracker = ProgressTracker(status_msg, "Downloading Telegram File")
+            tracker = ProgressTracker(status_msg, "Telegram Media Download")
             downloaded_file = await orig_msg.download(
                 file_name=dest_path,
                 progress=tracker.progress_callback
@@ -421,10 +379,9 @@ async def process_task_callback(_, query: CallbackQuery):
         if file_size > (2000 * 1024 * 1024):
             return await status_msg.edit_text(f"❌ File size (`{file_size_human}`) exceeds Telegram's 2 GB limit.")
 
-        # Preset Sample Handling
         if action in ("sample_30", "sample_60"):
             sample_duration = 30 if action == "sample_30" else 60
-            await status_msg.edit_text(f"✂️ **Extracting {sample_duration}s sample with ffmpeg...**")
+            await status_msg.edit_text(f"✂️ **Extracting {sample_duration}s preview clip with ffmpeg...**")
             meta = await get_video_metadata(downloaded_file)
             start_timestamp = 60 if meta["duration"] > (sample_duration + 60) else 5
             sample_output = os.path.join(task_dir, f"sample_{sample_duration}s.mp4")
@@ -448,9 +405,8 @@ async def process_task_callback(_, query: CallbackQuery):
             await status_msg.delete()
             return
 
-        # Video Upload
         if action == "up_vid":
-            await status_msg.edit_text("🎞️ **Parsing metadata & uploading video...**")
+            await status_msg.edit_text("🎞️ **Generating video thumbnail & parsing parameters...**")
             meta = await get_video_metadata(downloaded_file)
             thumb_path = os.path.join(task_dir, "thumb.jpg")
             await generate_thumbnail(downloaded_file, thumb_path, timestamp_sec=15)
@@ -470,7 +426,6 @@ async def process_task_callback(_, query: CallbackQuery):
             await status_msg.delete()
             return
 
-        # Document Upload
         if action == "up_doc":
             thumb_path = os.path.join(task_dir, "thumb.jpg")
             await generate_thumbnail(downloaded_file, thumb_path, timestamp_sec=10)
@@ -491,20 +446,18 @@ async def process_task_callback(_, query: CallbackQuery):
     except MessageNotModified:
         pass
     except Exception as e:
-        logger.error(f"Task error: {e}")
+        logger.error(f"Task processing error: {e}")
         await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
         ACTIVE_TASKS.pop(task_id, None)
 
-# --- 9. Startup Runner ---
+# --- 8. Runner ---
 async def start_all():
-    await start_health_server()
-    asyncio.create_task(keep_alive_worker())
-    asyncio.create_task(stale_cleanup_worker())
+    asyncio.create_task(disk_cleanup_worker())
     logger.info("Starting Pyrogram bot...")
     await bot.start()
-    logger.info("Bot is running and actively listening for updates.")
+    logger.info("Pyrogram listener initialized.")
     await idle()
     await bot.stop()
 
