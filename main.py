@@ -24,11 +24,19 @@ from pyrogram.errors import FloodWait, MessageNotModified
 import config
 import database
 from helpers.aria_downloader import download_content
-from helpers.media_utils import get_video_metadata, generate_thumbnail, extract_sample_clip
+from helpers.media_utils import (
+    setup_heroku_env,
+    get_video_metadata,
+    generate_thumbnail,
+    extract_sample_clip
+)
 from helpers.progress import ProgressTracker, human_readable_size
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Run library environment check on startup
+setup_heroku_env()
 
 ACTIVE_TASKS = {}
 
@@ -414,7 +422,7 @@ async def process_task_callback(_, query: CallbackQuery):
             if not clip:
                 return await status_msg.edit_text("❌ Failed to slice video clip.")
 
-            # Free disk space
+            # Free disk space immediately
             try:
                 if os.path.exists(downloaded_file):
                     os.remove(downloaded_file)
